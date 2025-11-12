@@ -1,0 +1,67 @@
+# SPDX-License-Identifier: BSD-3-Clause
+# mruby/c configuration options
+
+menuconfig MRUBYC
+	bool "mruby/c support"
+	help
+	  Enable mruby/c - a lightweight Ruby implementation for embedded systems.
+
+	  mruby/c is designed for resource-constrained microcontrollers and
+	  provides a Ruby virtual machine with small memory footprint.
+
+if MRUBYC
+
+config MRUBYC_MEMORY_SIZE
+	int "Default memory pool size (bytes)"
+	default 32768
+	help
+	  Default memory pool size for mruby/c VM.
+	  This is used if you don't explicitly call mrbc_init_alloc().
+
+	  Adjust based on your Ruby scripts complexity:
+	  - Simple scripts: 8192-16384 bytes
+	  - Moderate scripts: 16384-32768 bytes
+	  - Complex scripts: 32768-65536 bytes
+
+config MRUBYC_TICK_UNIT
+	int "Scheduler tick unit (milliseconds)"
+	default 10
+	range 1 100
+	help
+	  Time between scheduler ticks in milliseconds.
+	  Valid values: 1, 2, 4, 10, or custom value.
+
+	  Smaller values = more responsive but higher overhead
+	  Larger values = lower overhead but less responsive
+
+	  Default: 10ms (good balance for most applications)
+
+config MRUBYC_TIMESLICE_TICK_COUNT
+	int "Timeslice tick count"
+	default 1
+	range 1 100
+	help
+	  Number of ticks allocated to each task before preemption.
+
+	  Effective timeslice = TICK_UNIT * TIMESLICE_TICK_COUNT
+	  Example: 10ms * 1 = 10ms per task
+
+	  For Zephyr, usually keep this at 1 and let Zephyr handle scheduling.
+
+config MRUBYC_USE_MATH
+	bool "Enable Math module support"
+	default y
+	help
+	  Enable the Math module (sin, cos, sqrt, etc.)
+
+	  Disable to save code space if you don't need floating point math.
+
+config MRUBYC_CONVERT_CRLF
+	bool "Convert LF to CRLF in output"
+	default n
+	help
+	  Automatically convert LF (\n) to CRLF (\r\n) in console output.
+
+	  Enable if your terminal requires CRLF line endings.
+
+endif # MRUBYC
