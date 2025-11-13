@@ -34,8 +34,14 @@ zephyr_library_sources(
   ext/mrubyc/hal/zephyr/hal.c
 )
 
-# Include directories
+# Include directories for the library itself
 zephyr_library_include_directories(
+  ext/mrubyc/src
+  ext/mrubyc/hal/zephyr
+)
+
+# Expose headers to applications
+zephyr_include_directories(
   ext/mrubyc/src
   ext/mrubyc/hal/zephyr
 )
@@ -46,3 +52,4 @@ zephyr_library_include_directories(
 # )
 
 endif() # CONFIG_MRUBYC
+
