@@ -1,4 +1,0 @@
-name: mrubyc
-build:
-  cmake: .
-  kconfig: Kconfig

@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: Apache-2.0
+# HAKO Extensions Configuration
+
+menu "HAKO Extensions"
+	depends on HAKO
+
+# Source individual extension Kconfig files
+rsource "zephyr-gpio/Kconfig"
+
+# Add more extensions here:
+# rsource "zephyr-i2c/Kconfig"
+# rsource "zephyr-spi/Kconfig"
+
+endmenu

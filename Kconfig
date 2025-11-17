@@ -1,21 +1,29 @@
-# SPDX-License-Identifier: BSD-3-Clause
-# mruby/c configuration options
+# SPDX-License-Identifier: Apache-2.0
+# Hako configuration options
 
-menuconfig MRUBYC
-	bool "mruby/c support"
+menuconfig HAKO
+	bool "Hako - Ruby for IoT"
 	help
-	  Enable mruby/c - a lightweight Ruby implementation for embedded systems.
+	  Enable Hako - A complete Ruby runtime for embedded systems and IoT.
 
-	  mruby/c is designed for resource-constrained microcontrollers and
-	  provides a Ruby virtual machine with small memory footprint.
+	  Hako combines the lightweight Hako VM (based on mruby/c), PicoRuby
+	  compiler, and a curated package ecosystem to bring Ruby to
+	  resource-constrained embedded systems.
 
-if MRUBYC
+	  Hako (箱) means "box" in Japanese - representing the package system
+	  at the heart of this runtime.
 
-config MRUBYC_MEMORY_SIZE
+	  Requirements:
+	  - POSIX API (automatically enabled)
+	  - File system (for package loading, optional)
+
+if HAKO
+
+config HAKO_MEMORY_SIZE
 	int "Default memory pool size (bytes)"
 	default 32768
 	help
-	  Default memory pool size for mruby/c VM.
+	  Default memory pool size for Hako VM.
 	  This is used if you don't explicitly call mrbc_init_alloc().
 
 	  Adjust based on your Ruby scripts complexity:
@@ -23,7 +31,15 @@ config MRUBYC_MEMORY_SIZE
 	  - Moderate scripts: 16384-32768 bytes
 	  - Complex scripts: 32768-65536 bytes
 
-config MRUBYC_TICK_UNIT
+config HAKO_LOG_LEVEL
+	int "HAKO log level"
+	default 3
+	range 0 4
+	help
+	  Set the log level for HAKO subsystem.
+	  0 = OFF, 1 = ERR, 2 = WRN, 3 = INF, 4 = DBG
+
+config HAKO_TICK_UNIT
 	int "Scheduler tick unit (milliseconds)"
 	default 10
 	range 1 100
@@ -36,7 +52,7 @@ config MRUBYC_TICK_UNIT
 
 	  Default: 10ms (good balance for most applications)
 
-config MRUBYC_TIMESLICE_TICK_COUNT
+config HAKO_TIMESLICE_TICK_COUNT
 	int "Timeslice tick count"
 	default 1
 	range 1 100
@@ -48,7 +64,7 @@ config MRUBYC_TIMESLICE_TICK_COUNT
 
 	  For Zephyr, usually keep this at 1 and let Zephyr handle scheduling.
 
-config MRUBYC_USE_MATH
+config HAKO_USE_MATH
 	bool "Enable Math module support"
 	default y
 	help
@@ -56,7 +72,7 @@ config MRUBYC_USE_MATH
 
 	  Disable to save code space if you don't need floating point math.
 
-config MRUBYC_CONVERT_CRLF
+config HAKO_CONVERT_CRLF
 	bool "Convert LF to CRLF in output"
 	default n
 	help
@@ -64,4 +80,166 @@ config MRUBYC_CONVERT_CRLF
 
 	  Enable if your terminal requires CRLF line endings.
 
-endif # MRUBYC
+menuconfig HAKO_COMPILER
+	bool "Enable Ruby compiler and REPL (PicoRuby)"
+	depends on SHELL
+	help
+	  Enable the PicoRuby compiler (mruby-compiler2) for runtime
+	  compilation and interactive REPL support.
+
+	  This adds approximately 250-500KB to ROM but enables:
+	  - eval() function for runtime compilation
+	  - Interactive Ruby shell (irb command in Zephyr shell)
+	  - On-device script compilation
+
+	  Requires: Zephyr shell subsystem (CONFIG_SHELL=y)
+
+	  Based on mruby-compiler2 with Prism parser.
+
+if HAKO_COMPILER
+
+config HAKO_COMPILER_OPTIMIZE_SIZE
+	bool "Optimize compiler for size"
+	default y
+	help
+	  Enable size optimizations for the compiler and parser.
+
+	  Sets PRISM_BUILD_MINIMAL and other compiler flags to
+	  reduce ROM usage by approximately 30-40%.
+
+	  Disable only if you need full parser features for
+	  advanced metaprogramming or debugging.
+
+config HAKO_COMPILER_MEMORY_SIZE
+	int "Compiler memory pool size (bytes)"
+	default 65536
+	help
+	  Memory allocated for compilation context and parser state.
+
+	  This is separate from HAKO_MEMORY_SIZE and is used
+	  during compilation only. After compilation, this memory
+	  can be reclaimed.
+
+	  Recommended values:
+	  - Small scripts: 32768 bytes
+	  - Medium scripts: 65536 bytes (default)
+	  - Large/complex scripts: 131072 bytes
+
+config HAKO_EVAL
+	bool "Enable eval() function"
+	default y
+	help
+	  Adds Kernel.eval() for evaluating Ruby strings at runtime.
+
+	  This is the core functionality that enables dynamic
+	  code execution. Disable only if you want compiler support
+	  for other purposes (like a custom REPL implementation).
+
+config HAKO_IRB_COMMAND
+	bool "Register 'ruby' shell commands"
+	default y
+	depends on SHELL
+	help
+	  Adds Ruby shell commands to Zephyr shell.
+
+	  Commands:
+	    uart:~$ ruby "puts 'Hello!'"     # Execute Ruby string
+	    uart:~$ ruby_file /path/to/script.rb  # Load and run file
+	    uart:~$ ruby_info                # Show compiler info
+
+	  Supports:
+	  - Direct code execution from command line
+	  - Loading scripts from filesystem (if enabled)
+	  - Expression evaluation and result printing
+	  - Exception handling and error reporting
+
+config HAKO_FILE_SUPPORT
+	bool "Enable loading Ruby scripts from filesystem"
+	depends on HAKO_IRB_COMMAND
+	depends on FILE_SYSTEM
+	default y if FILE_SYSTEM
+	help
+	  Enable the ruby_file command to load and execute Ruby scripts
+	  from the filesystem.
+
+	  Requires filesystem support (LittleFS, FAT, etc.)
+
+	  Usage:
+	    uart:~$ ruby_file /sd/script.rb
+	    uart:~$ ruby_file /flash/app.rb
+
+config HAKO_COMPILER_DEBUG
+	bool "Enable compiler debug output"
+	default n
+	help
+	  Enable debug output from the compiler and parser.
+
+	  This adds significant code size and runtime overhead.
+	  Only enable for compiler development or debugging.
+
+# =============================================================================
+# PicoRuby Standard Library Gems
+# =============================================================================
+
+config HAKO_REQUIRE
+	bool "Enable require/load support (picoruby-require)"
+	depends on HAKO_EVAL
+	depends on FILE_SYSTEM
+	default y if HAKO_EVAL
+	help
+	  Enable Ruby require/load functionality for loading libraries.
+
+	  Provides:
+	  - require(name) - Load library once
+	  - load(path) - Load file (every time)
+	  - $LOAD_PATH - Search paths
+	  - $LOADED_FEATURES - Loaded files tracking
+
+	  Supports:
+	  - Built-in packages (compiled into firmware)
+	  - Filesystem packages (.rb and .mrb files)
+
+	  ROM Impact: ~3 KB
+
+config HAKO_SANDBOX
+	bool "Enable sandbox execution (picoruby-sandbox)"
+	depends on HAKO_COMPILER
+	default y if HAKO_REQUIRE
+	help
+	  Enable isolated VM execution for loaded code.
+
+	  Sandbox provides isolated compilation and execution environment
+	  to prevent loaded code from crashing the main VM.
+
+	  Used by require/load for safe code loading.
+
+	  ROM Impact: ~4 KB
+
+config HAKO_METAPROG
+	bool "Enable metaprogramming (picoruby-metaprog)"
+	default n
+	help
+	  Enable metaprogramming and reflection capabilities.
+
+	  Provides:
+	  - send(method, args) - Dynamic method invocation
+	  - methods - List object methods
+	  - instance_variables - Inspect instance variables
+	  - respond_to? - Check method existence
+
+	  Useful for:
+	  - Package introspection
+	  - Dynamic method calls
+	  - Debugging
+
+	  ROM Impact: ~2 KB
+
+endif # HAKO_COMPILER
+
+# =============================================================================
+# HAKO Extensions
+# =============================================================================
+
+rsource "extensions/Kconfig"
+
+endif # HAKO

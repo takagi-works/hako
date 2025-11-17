@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: Apache-2.0
+# Zephyr::GPIO configuration
+
+config HAKO_ZEPHYR_GPIO
+	bool "Zephyr::GPIO Ruby API"
+	depends on HAKO
+	depends on GPIO
+	help
+	  Enable Zephyr::GPIO module for controlling GPIO pins from Ruby.
+
+	  Provides Ruby API for GPIO operations:
+	    led = Zephyr::GPIO.open(:led0, mode: :output)
+	    led.write(1)
+	    led.toggle
+	    value = led.read
+
+	  Requires devicetree aliases for logical GPIO names.
