@@ -12,7 +12,7 @@ Hako (箱, meaning "box" in Japanese) is a complete Ruby runtime for embedded sy
 
 ### Key Features
 
-- **Lightweight Mruby/c VM** - Ultra-compact bytecode interpreter (~40 KB ROM, 40 KB RAM)
+- **Lightweight Mruby/c VM** - Ultra-compact bytecode interpreter (~40 KB ROM, 40 KB RAM) (mruby/c is modified to run, see [repo](https://github.com/domitea/mrubyc/tree/zephyr))
 - **On-Device Compilation** - PicoRuby compiler with Prism parser (optional, +500 KB ROM)
 - **Interactive Shell** - REPL-like experience via Zephyr shell
 - **Filesystem Support** - Load Ruby scripts from LittleFS, FAT, or other filesystems
