@@ -1,0 +1,3 @@
+[submodule "ext/mrubyc"]
+	path = ext/mrubyc
+	url = git@github.com:domitea/mrubyc.git

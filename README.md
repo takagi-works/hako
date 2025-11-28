@@ -25,6 +25,7 @@ Hako (箱, meaning "box" in Japanese) is a complete Ruby runtime for embedded sy
 
 - [Quick Start](#quick-start)
 - [Complete Getting Started Tutorial](#complete-getting-started-tutorial)
+- [VM Modifications and Differences from Original Mruby/c](#vm-modifications-and-differences-from-original-mrubyc)
 - [Architecture](#architecture)
 - [Ruby Compilation Workflow](#ruby-compilation-workflow)
   - [Runtime Compilation (On-Device)](#runtime-compilation-on-device)
@@ -305,46 +306,35 @@ int main(void)
     int ret;
 
     LOG_INF("=== My Ruby Application ===");
-    LOG_INF("Initializing Mruby/c VM...");
+    LOG_INF("Initializing Ruby VM...");
 
-    /* Initialize Hako VM (handles memory pool automatically) */
+    // Initialize HAKO VM
     ret = hako_init();
     if (ret < 0) {
-        LOG_ERR("Failed to initialize VM: %d", ret);
+        LOG_ERR("Failed to initialize HAKO VM: %d", ret);
         return ret;
     }
 
-    /* Load all compiled bytecode from registry */
+    // Load embedded bytecode registry
     LOG_INF("Loading Ruby bytecode...");
     ret = hako_load_registry(hako_my_ruby_app_registry,
-                             hako_my_ruby_app_registry_count);
+                            hako_my_ruby_app_registry_count);
     if (ret < 0) {
-        LOG_ERR("Failed to load bytecode: %d", ret);
+        LOG_ERR("Failed to load bytecode registry: %d", ret);
         return ret;
     }
 
-    /* Find and load the main script */
-    const uint8_t *main_bytecode = hako_find_bytecode("main");
-    if (!main_bytecode) {
-        LOG_ERR("main.rb not found in registry!");
-        return -ENOENT;
-    }
-
-    ret = hako_load_bytecode("main", main_bytecode);
+    // Start the VM thread (automatically finds and loads "main" if present)
+    ret = hako_start_vm_thread();
     if (ret < 0) {
-        LOG_ERR("Failed to load main: %d", ret);
+        LOG_ERR("Ruby VM failed to start: %d", ret);
         return ret;
     }
 
-    /* Run the Ruby VM */
-    LOG_INF("Starting Ruby application...");
-    ret = hako_run();
-    if (ret < 0) {
-        LOG_ERR("Ruby execution failed: %d", ret);
-        return ret;
-    }
+    LOG_INF("Ruby VM thread started");
 
-    LOG_INF("Ruby application completed successfully");
+    // VM thread runs in background, main thread can do other work
+    // or just exit if no other work needed
     return 0;
 }
 ```
@@ -407,6 +397,281 @@ sleep 1
 led.write(0)  # Turn off
 led.toggle    # Toggle state
 ```
+---
+
+## VM Modifications and Differences from Original Mruby/c
+
+Hako includes significant enhancements to the original mruby/c VM to better support embedded systems and Zephyr RTOS integration:
+
+### Modified Scheduler (rrt0.c)
+
+The Hako VM includes a **completely rewritten cooperative multitasking scheduler** with these improvements:
+
+**Key Changes:**
+- **Simplified Architecture**: Streamlined queue management with clear separation of READY, WAITING, SUSPENDED, and DORMANT task states
+- **Priority-based Scheduling**: Tasks enqueue by priority (lower value = higher priority) with round-robin for same-priority tasks
+- **Cooperative Green Threads**: Pure cooperative multitasking without preemption (tasks must explicitly yield via `sleep`, `Task.pass`, etc.)
+- **Enhanced Sleep Implementation**: Tick-based sleep with precise wakeup timing and support for task wakeup from external events
+- **Mutex Support**: Full mutex implementation with priority-based handoff to waiting tasks
+- **Soft-IRQ System**: Lightweight interrupt handling mechanism (`mrbc_irq_register`, `mrbc_irq_raise`, `mrbc_irq_poll`)
+- **Join Semantics**: Tasks can wait for other tasks to complete with `Task.join`
+
+**Scheduler Differences from Original mruby/c:**
+
+| Feature | Original mruby/c | Hako VM |
+|---------|------------------|---------|
+| **Task Queues** | Complex multi-priority queues | Single priority-sorted READY queue + state queues |
+| **Scheduling** | Priority with preemption hints | Pure cooperative with explicit yields |
+| **Sleep** | Basic tick counting | Precise wakeup timing + early wakeup support |
+| **Mutexes** | Basic lock/unlock | Priority inheritance + waiter queue management |
+| **IRQ Handling** | Direct callbacks | Soft-IRQ with pending flags + polling |
+| **Task States** | DORMANT, READY, RUNNING | DORMANT, READY, RUNNING, WAITING, SUSPENDED |
+| **API Completeness** | Core methods only | Full Ruby Task/Mutex API with all methods |
+
+### Enhanced Loader (loader.c)
+
+The **Hako loader** provides a high-level API for managing Ruby bytecode and VM lifecycle:
+
+**Key Features:**
+- **Bytecode Registry**: Global registry system for storing up to 32 bytecode modules with `require()` support
+- **Thread-Safe Operations**: Mutex-protected VM access for safe initialization and bytecode loading
+- **Dedicated VM Thread**: Automatic creation of a Zephyr thread to run the VM scheduler loop
+- **Core Method Registration**: Automatic registration of Task, Mutex, and VM methods at initialization
+- **Extension Discovery**: Auto-discovery and initialization of C extensions via linker sections
+
+**Loader Differences from Original mruby/c:**
+
+| Feature | Original mruby/c | Hako Loader |
+|---------|------------------|-------------|
+| **VM Initialization** | Manual `mrbc_init_alloc()` + `mrbc_init_global()` | Single `hako_init()` call |
+| **Bytecode Loading** | Direct `mrbc_load_mrb()` calls | Registry-based with `hako_load_registry()` |
+| **Execution Model** | Caller must call `mrbc_run()` in loop | Automatic VM thread with `hako_run()` |
+| **Thread Safety** | No protection | Mutex-protected operations |
+| **Extension System** | Manual registration | Automatic discovery and initialization |
+| **require() Support** | Not built-in | Built-in bytecode registry for module loading |
+
+### Scheduler State Machine
+
+The Hako scheduler uses a clean state machine for task management:
+
+```
+DORMANT (newly created, not started)
+   │
+   └─[Task.run]──> READY ──┐
+                      ↑     │
+                      │     └─[scheduled]──> RUNNING ──┐
+                      │                         │      │
+                      │                         │      ├─[sleep]──> WAITING (sleep)
+                      │                         │      │               │
+                      │                         │      ├─[join]──> WAITING (join)
+                      │                         │      │               │
+                      │                         │      └─[mutex lock fails]──> WAITING (mutex)
+                      │                         │                      │
+                      │                         │                      └──[wakeup/unlock]
+                      ├─────────────────────────┘
+                      │
+                      └─[suspend]──> SUSPENDED
+                                         │
+                                         └─[resume]──> READY or WAITING
+```
+
+### VM Thread Integration
+
+Unlike the original mruby/c which expects the application to call `mrbc_run()` in a loop, Hako automatically creates a dedicated Zephyr thread:
+
+**VM Thread Behavior (src/hako/loader.c:306-319):**
+```c
+void hako_vm_thread(void *p1, void *p2, void *p3)
+{
+    while (1) {
+        mrbc_run();      // Execute one task quantum
+        mrbc_tick();     // Update scheduler tick, wake sleeping tasks
+        k_msleep(1);     // Yield to Zephyr scheduler (1ms sleep)
+    }
+}
+```
+
+**Benefits:**
+- **Cooperative Integration**: VM tasks cooperate with Zephyr threads
+- **Precise Timing**: Regular tick updates ensure accurate sleep/timeout behavior
+- **Resource Sharing**: VM shares CPU time fairly with other Zephyr threads
+- **No Blocking**: Application doesn't need to dedicate main thread to VM
+
+### Core Method Registration
+
+The loader automatically registers all core mruby/c methods at initialization (src/hako/loader.c:249-304):
+
+- **Object methods**: `sleep`, `sleep_ms`
+- **Task methods**: `create`, `current`, `get`, `join`, `list`, `name`, `name=`, `name_list`, `pass`, `priority`, `priority=`, `raise`, `resume`, `rewind`, `run`, `status`, `suspend`, `terminate`, `value`
+- **Mutex methods**: `new`, `lock`, `unlock`, `try_lock`, `locked?`, `owned?`
+- **VM methods**: `tick`
+
+This eliminates the need for manual method registration and ensures the Ruby API is always available.
+
+### Multireactor Pattern Architecture (Planned)
+
+The Hako VM scheduler enables a **multireactor pattern** where Ruby Tasks act as lightweight coroutines/callbacks, all executing cooperatively within a single Zephyr thread:
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                        Single Zephyr Thread                         │
+│                      (hako_vm_thread)                               │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  ┌───────────────────────────────────────────────────────────┐      │
+│  │          Hako VM Scheduler (Cooperative)                  │      │
+│  │                                                           │      │
+│  │  ┌──────────────────────────────────────────────────┐     │      │
+│  │  │         Event Loop (Main Reactor)                │     │      │
+│  │  │  while(1):                                       │     │      │
+│  │  │    1. mrbc_irq_poll()    // Check soft-IRQs      │     │      │
+│  │  │    2. wake_sleeping_tasks() // Process timers    │     │      │
+│  │  │    3. pick next READY task from priority queue   │     │      │
+│  │  │    4. mrbc_vm_run() // Execute one quantum       │     │      │
+│  │  │    5. mrbc_tick()   // Update scheduler tick     │     │      │
+│  │  │    6. k_msleep(1)   // Yield to Zephyr           │     │      │
+│  │  └──────────────────────────────────────────────────┘     │      │
+│  │                            │                              │      │
+│  │                            ▼                              │      │
+│  │  ┌─────────────────────────────────────────────────┐      │      │
+│  │  │         Task Queues (All Coroutines)            │      │      │
+│  │  ├─────────────────────────────────────────────────┤      │      │
+│  │  │ READY (priority-sorted):                        │      │      │
+│  │  │  ┌─────────┐  ┌─────────┐  ┌─────────┐          │      │      │
+│  │  │  │ Task A  │→ │ Task B  │→ │ Task C  │         │      │      │
+│  │  │  │ Pri: 1  │  │ Pri: 2  │  │ Pri: 2  │          │      │      │
+│  │  │  └─────────┘  └─────────┘  └─────────┘          │      │      │
+│  │  │                                                 │      │      │
+│  │  │ WAITING (blocked on events):                    │      │      │
+│  │  │  ┌─────────────┐  ┌──────────────┐              │      │      │
+│  │  │  │ Task D      │  │ Task E       │              │      │      │
+│  │  │  │ Reason:     │  │ Reason:      │              │      │      │
+│  │  │  │  SLEEP      │  │  MUTEX       │              │      │      │
+│  │  │  │ wakeup:     │  │ waiting_for: │              │      │      │
+│  │  │  │  tick+100   │  │  mutex_x     │              │      │      │
+│  │  │  └─────────────┘  └──────────────┘              │      │      │
+│  │  │                                                 │      │      │
+│  │  │ SUSPENDED:                                      │      │      │
+│  │  │  ┌─────────┐                                    │      │      │
+│  │  │  │ Task F  │  (manually suspended)              │      │      │
+│  │  │  └─────────┘                                    │      │      │
+│  │  │                                                 │      │      │
+│  │  │ DORMANT:                                        │      │      │
+│  │  │  ┌─────────┐                                    │      │      │
+│  │  │  │ Task G  │  (finished/not started)            │      │      │
+│  │  │  └─────────┘                                    │      │      │
+│  │  └─────────────────────────────────────────────────┘      │      │
+│  └───────────────────────────────────────────────────────────┘      │
+│                                                                     │
+│  ┌───────────────────────────────────────────────────────────┐      │
+│  │                    Soft-IRQ System                        │      │
+│  │  (Event callbacks from external sources)                  │      │
+│  ├───────────────────────────────────────────────────────────┤      │
+│  │ IRQ Line 0: GPIO interrupt → callback → wakeup Task A    │      │
+│  │ IRQ Line 1: Timer expire   → callback → wakeup Task B    │      │
+│  │ IRQ Line 2: UART data      → callback → wakeup Task C    │      │
+│  │ IRQ Line 3: Network event  → callback → wakeup Task D    │      │
+│  └───────────────────────────────────────────────────────────┘      │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+          ▲                                       │
+          │                                       ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│               External Event Sources (Zephyr)                       │
+├─────────────────────────────────────────────────────────────────────┤
+│ • GPIO Interrupts → mrbc_irq_raise(0)                               │
+│ • Hardware Timers → mrbc_irq_raise(1)                               │
+│ • UART/Serial RX  → mrbc_irq_raise(2)                               │
+│ • Network Events  → mrbc_irq_raise(3)                               │
+│ • Message Queues  → mrbc_irq_raise(4)                               │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+**Key Benefits of the Multireactor Pattern:**
+
+1. **Single-Threaded Simplicity**
+   - No threading complexity or race conditions
+   - No mutex overhead between Ruby tasks
+   - Deterministic execution order based on priority
+
+2. **Lightweight Coroutines**
+   - Each Ruby Task is a cooperative coroutine (~256 bytes overhead)
+   - Fast context switching (just VM register save/restore)
+   - Can have dozens of concurrent tasks without thread stack overhead
+
+3. **Event-Driven Programming**
+   - Tasks yield on I/O (sleep, mutex, join)
+   - External events wake tasks via soft-IRQ system
+   - Similar to Node.js event loop or Python asyncio
+
+4. **Cooperative Multitasking**
+   - Tasks explicitly yield control (`sleep`, `Task.pass`, blocking operations)
+   - No preemption within VM (except at yield points)
+   - Predictable, deterministic behavior
+
+5. **Integration with Zephyr**
+   - VM thread is just another Zephyr thread
+   - External Zephyr threads communicate via soft-IRQ
+   - Message queues, semaphores bridge Zephyr ↔ Ruby
+
+**Example: Multiple Reactors in Ruby**
+
+This is a rough idea what I have in mind. Design of DSL is driven by this quote: 
+
+> For me, the purpose of life is, at least partly, to have joy. Programmers often feel joy when they can concentrate on the creative side of programming, so Ruby is designed to make programmers happy.
+Yukihiro Matsumoto, creator of Ruby Language
+
+```ruby
+# Task A: LED blinker (runs every 500ms)
+Task.create(:blinker) do
+  led = GPIO.open(:led0, mode: :output)
+  loop do
+    led.toggle
+    sleep 0.5
+  end
+end
+
+# Task B: Sensor reader (runs every 1s)
+Task.create(:sensor) do
+  sensor = I2C.open(:sensor0)
+  loop do
+    temp = sensor.read_temperature
+    puts "Temperature: #{temp}°C"
+    sleep 1
+  end
+end
+
+# Task C: Button handler (waits for IRQ)
+Task.create(:button) do
+  button = GPIO.open(:button0, mode: :input)
+  button.on(:rising) do
+    puts "Button pressed!"
+  end
+end
+
+# Task D: Network client (cooperative I/O)
+Task.create(:client) do
+  socket = Socket.open(:tcp, "192.168.1.100", 8080)
+  socket.on_read(1024) do
+    process(data)
+  end
+end
+
+# All 4 tasks run cooperatively in a single Zephyr thread!
+# Each yields when waiting for I/O or sleeping
+```
+
+**Comparison: Traditional Threading vs Multireactor**
+
+| Aspect | Traditional Threading | Hako Multireactor |
+|--------|----------------------|-------------------|
+| **Memory** | Each thread needs 2-4 KB stack | Each task ~256 bytes |
+| **Context Switch** | Expensive (save/restore CPU registers) | Cheap (VM register copy) |
+| **Synchronization** | Mutexes, semaphores needed | No sync needed (single-threaded) |
+| **Scalability** | 5-10 threads typical on MCU | 20-50 tasks easily |
+| **Debugging** | Race conditions, deadlocks | Deterministic, sequential |
+| **CPU Efficiency** | Preemption overhead | Pure cooperative, no waste |
+
 ---
 
 ## Architecture
@@ -526,32 +791,32 @@ For production deployments, compile Ruby to C arrays at build time:
 ┌─────────────────────────────────────────────────────────┐
 │  Development Machine (x86/x64)                          │
 ├─────────────────────────────────────────────────────────┤
-│                                                          │
+│                                                         │
 │   my_script.rb                                          │
 │   ┌──────────────────────┐                              │
 │   │ puts "Hello!"        │                              │
-│   │ 5.times { |i|       │                              │
+│   │ 5.times { |i|       │                               │
 │   │   puts "Count: #{i}" │                              │
 │   │ }                    │                              │
 │   └──────────┬───────────┘                              │
-│              ↓                                           │
+│              ↓                                          │
 │   ┌──────────────────────────────────┐                  │
 │   │  mrbc Compiler (mruby bytecode)  │                  │
 │   │  (Host tool, not on device)      │                  │
 │   └──────────┬───────────────────────┘                  │
-│              ↓                                           │
+│              ↓                                          │
 │   ┌──────────────────────────────────┐                  │
 │   │  my_script.c (Generated)         │                  │
 │   │  const uint8_t bytecode[] = {    │                  │
 │   │    0x52, 0x49, 0x54, 0x45, ...   │                  │
 │   │  };                              │                  │
 │   └──────────┬───────────────────────┘                  │
-│              ↓                                           │
+│              ↓                                          │
 │   ┌──────────────────────────────────┐                  │
 │   │  CMake Integration               │                  │
 │   │  hako_compile_ruby_to_c()        │                  │
 │   └──────────┬───────────────────────┘                  │
-│              ↓                                           │
+│              ↓                                          │
 │   ┌──────────────────────────────────┐                  │
 │   │  Link into firmware              │                  │
 │   │  (Embedded in Flash)             │                  │
@@ -561,7 +826,7 @@ For production deployments, compile Ruby to C arrays at build time:
 ┌──────────────────────────────────────────────────────────┐
 │  Target Device (ARM Cortex-M, RISC-V, etc.)              │
 ├──────────────────────────────────────────────────────────┤
-│                                                           │
+│                                                          │
 │   Flash Memory                                           │
 │   ┌──────────────────────────────────┐                   │
 │   │  Firmware                        │                   │
@@ -569,13 +834,13 @@ For production deployments, compile Ruby to C arrays at build time:
 │   │  ├─ Mruby/c VM (~40 KB)          │                   │
 │   │  └─ bytecode[] array             │                   │
 │   └──────────┬───────────────────────┘                   │
-│              ↓                                            │
+│              ↓                                           │
 │   ┌──────────────────────────────────┐                   │
 │   │  C Code                          │                   │
 │   │  mrbc_load_mrb(bytecode);        │                   │
 │   │  mrbc_run();                     │                   │
 │   └──────────┬───────────────────────┘                   │
-│              ↓                                            │
+│              ↓                                           │
 │   ┌──────────────────────────────────┐                   │
 │   │  Mruby/c VM executes bytecode    │                   │
 │   │  (No compiler needed!)           │                   │
@@ -636,18 +901,28 @@ target_sources(app PRIVATE src/main.c)
 #include "my_app_registry.h"  /* Auto-generated */
 
 int main(void) {
-    /* Initialize VM */
-    hako_init();
+    int ret;
 
-    /* Load all bytecode */
-    hako_load_registry(hako_my_app_registry,
-                       hako_my_app_registry_count);
+    // Initialize VM
+    ret = hako_init();
+    if (ret < 0) {
+        return ret;
+    }
 
-    /* Load and run main script */
-    const uint8_t *bytecode = hako_find_bytecode("main");
-    hako_load_bytecode("main", bytecode);
-    hako_run();
+    // Load all bytecode from registry
+    ret = hako_load_registry(hako_my_app_registry,
+                            hako_my_app_registry_count);
+    if (ret < 0) {
+        return ret;
+    }
 
+    // Start VM thread (finds and loads "main" automatically)
+    ret = hako_start_vm_thread();
+    if (ret < 0) {
+        return ret;
+    }
+
+    // VM now running in background thread
     return 0;
 }
 ```
@@ -847,6 +1122,8 @@ Hako provides extensive configuration options through Zephyr's Kconfig system.
 |--------|------|---------|-------------|
 | `CONFIG_HAKO` | bool | n | Enable Hako Ruby runtime with Mruby/c VM |
 | `CONFIG_HAKO_MEMORY_SIZE` | int | 32768 | VM memory pool size in bytes (adjust based on script complexity) |
+| `CONFIG_HAKO_VM_STACK_SIZE` | int | 4096 | VM thread stack size in bytes |
+| `CONFIG_HAKO_VM_PRIORITY` | int | K_LOWEST_APPLICATION_THREAD_PRIO | VM thread priority (lower = higher priority) |
 | `CONFIG_HAKO_LOG_LEVEL` | int | 3 | Log level: 0=OFF, 1=ERR, 2=WRN, 3=INF, 4=DBG |
 | `CONFIG_HAKO_TICK_UNIT` | int | 10 | Scheduler tick unit in milliseconds (1-100) |
 | `CONFIG_HAKO_TIMESLICE_TICK_COUNT` | int | 1 | Number of ticks per task timeslice |
@@ -1030,7 +1307,7 @@ Understanding what Hako doesn't support helps you design better applications:
 
 ### When to Use Hako
 
-**✅ Great For:**
+**Great For:**
 - Configuration and settings management
 - Scripting hardware behavior
 - Rapid prototyping on embedded devices
@@ -1148,25 +1425,30 @@ if (ret < 0) {
 
 ---
 
-#### `int hako_run(void)`
+#### `int hako_run(void)` / `int hako_start_vm_thread(void)`
 
-Executes all loaded Ruby bytecode.
+Starts the VM thread to execute all loaded Ruby bytecode in background.
 
 **Returns:** 0 on success, negative error code on failure
 
 **Example:**
 ```c
-ret = hako_run();
+ret = hako_start_vm_thread();
 if (ret < 0) {
-    LOG_ERR("Ruby execution failed: %d", ret);
+    LOG_ERR("Ruby VM failed to start: %d", ret);
 }
 ```
 
 **Details:**
-- Blocks until Ruby code completes
-- Handles exceptions and errors
-- Can be called only once per VM initialization
-- VM state is preserved after execution
+- Creates a dedicated Zephyr thread for the VM (priority: `CONFIG_HAKO_VM_PRIORITY`)
+- Automatically finds and loads "main" bytecode if present in registry
+- VM runs cooperatively in background (event loop with 1ms tick)
+- Thread stack size: `CONFIG_HAKO_VM_STACK_SIZE` (default: 4096 bytes)
+- Main thread continues and can perform other tasks
+- Thread name: "hako_vm"
+- Only starts once (subsequent calls return success immediately)
+
+**Note:** `hako_run()` is an alias for `hako_start_vm_thread()` for backward compatibility.
 
 ---
 
@@ -1214,7 +1496,7 @@ int main(void)
     int ret;
 
     /* 1. Initialize VM */
-    LOG_INF("Initializing Mruby/c VM...");
+    LOG_INF("Initializing Ruby VM...");
     ret = hako_init();
     if (ret < 0) {
         LOG_ERR("hako_init failed: %d", ret);
@@ -1230,29 +1512,17 @@ int main(void)
         return ret;
     }
 
-    /* 3. Find and load main script */
-    LOG_INF("Loading main script...");
-    const uint8_t *main_bytecode = hako_find_bytecode("main");
-    if (!main_bytecode) {
-        LOG_ERR("main.rb not found in registry");
-        return -ENOENT;
-    }
-
-    ret = hako_load_bytecode("main", main_bytecode);
+    /* 3. Start VM thread (automatically finds and loads "main" if present) */
+    LOG_INF("Starting Ruby VM thread...");
+    ret = hako_start_vm_thread();
     if (ret < 0) {
-        LOG_ERR("hako_load_bytecode failed: %d", ret);
+        LOG_ERR("hako_start_vm_thread failed: %d", ret);
         return ret;
     }
 
-    /* 4. Execute Ruby code */
-    LOG_INF("Executing Ruby application...");
-    ret = hako_run();
-    if (ret < 0) {
-        LOG_ERR("hako_run failed: %d", ret);
-        return ret;
-    }
+    LOG_INF("Ruby VM thread started successfully");
 
-    LOG_INF("Ruby application completed successfully");
+    /* VM now runs in background, main can continue with other tasks */
     return 0;
 }
 ```
@@ -1339,7 +1609,7 @@ mrbc --version
 
 The following boards have been tested with Hako:
 
-- ✅ **qemu_x86** - QEMU x86 emulator (testing)
+- **qemu_x86** - QEMU x86 emulator (testing)
 - Add your tested boards via pull request!
 
 **Not Yet Tested (but should work):**
@@ -1628,7 +1898,7 @@ We welcome contributions! See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
 ## Roadmap
 
-### Completed ✅
+### Completed
 - [x] Mruby/c VM integration with Zephyr
 - [x] PicoRuby compiler integration
 - [x] Interactive shell (IRB-like) support
@@ -1638,14 +1908,15 @@ We welcome contributions! See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 - [x] CMake build-time compilation utilities
 - [x] Extension system with auto-registration
 - [x] GPIO extension (Zephyr::GPIO)
+- [x] Rewroted to new sheduler
 
-### In Progress 🚧
+### In Progress
 - [ ] More hardware extensions (I2C, SPI, UART, etc.)
 - [ ] Additional example applications
 - [ ] Performance optimizations
 - [ ] Better error messages and debugging
 
-### Planned Features 📋
+### Planned Features
 - [ ] Thread-safe VM option (mutex-protected operations)
 - [ ] Debugging support (breakpoints, stepping, inspection)
 - [ ] Performance profiling tools
@@ -1655,7 +1926,7 @@ We welcome contributions! See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 - [ ] Package manager for Ruby gems
 - [ ] More metaprogramming features
 
-### Future Exploration 🔮
+### Future Exploration
 - [ ] Multi-VM support (isolated contexts)
 - [ ] Foreign Function Interface (FFI)
 - [ ] Visual programming interface for Ruby scripting
